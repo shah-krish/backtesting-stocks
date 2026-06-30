@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+
 def fetch_and_prep_data(ticker, period="2y", interval="1h"):
     """Downloads historical data and computes basic candle metrics."""
     print(f"Fetching data for {ticker}...")
@@ -19,146 +20,83 @@ def fetch_and_prep_data(ticker, period="2y", interval="1h"):
 
     # Define structural movements mathematically
     df["Is_Drop"] = (df["Close"] < df["Open"]) & (
-        df["Body_Size"] > (df["Candle_Range"] * 0.50)
+            df["Body_Size"] > (df["Candle_Range"] * 0.50)
     )
     df["Is_Rally"] = (df["Close"] > df["Open"]) & (
-        df["Body_Size"] > (df["Candle_Range"] * 0.50)
+            df["Body_Size"] > (df["Candle_Range"] * 0.50)
     )
     df["Is_Base"] = df["Body_Size"] <= (df["Candle_Range"] * 0.50)
 
     return df.dropna()
 
 
-def backtest_demand_zones(df):
-    """Scans for DBR formations and tracks historical retests."""
-    active_zones = []
-    trade_logs = []
+def scan_for_dbr_zones(df):
+    """Scans backwards from the most recent candle to find DBR formations."""
+    found_zones = []
 
-    # Iterate through data (starting from index 2 to allow for pattern matching)
-    for i in range(2, len(df)):
+    # Iterate backwards from the newest candle down to index 2
+    for i in range(len(df) - 1, 1, -1):
         current_candle = df.iloc[i]
-        current_low = current_candle["Low"]
-        current_high = current_candle["High"]
-        current_close = df.iloc[i]["Close"]
-        current_time = df.index[i]
 
-        # ----------------------------------------------------
-        # 1. CHECK FOR RETESTS OF EXISTING ZONES FIRST
-        # ----------------------------------------------------
-        for zone in active_zones[:]:  # Iterate over a copy to safely remove items
-            # If price dips into the demand zone (touches Proximal Line)
-            if current_low <= zone["proximal_line"]:
-                # Check if it hit the stop loss (closed below Distal Line)
-                if current_close < zone["distal_line"]:
-                    trade_logs.append(
-                        {
-                            "Type": "DBR_Demand",
-                            "Base_Date": zone["formed_at"],
-                            "Leg_Out_Date": zone["leg_out_date"],  # NEW
-                            "Retested_At": current_time,
-                            "Result": "Stop_Loss",
-                        }
-                    )
-                    active_zones.remove(zone)
-                # Check if it bounced successfully (moved up past entry)
-                elif current_high > zone["proximal_line"] + (
-                        zone["proximal_line"] - zone["distal_line"]
-                ) * 2:
-                    trade_logs.append(
-                        {
-                            "Type": "DBR_Demand",
-                            "Base_Date": zone["formed_at"],
-                            "Leg_Out_Date": zone["leg_out_date"],
-                            "Retested_At": current_time,
-                            "Result": "Take_Profit_2R",
-                        }
-                    )
-                    active_zones.remove(zone)
-
-            # Invalidate zone if price completely breaks below without executing cleanly
-            elif current_low < zone["distal_line"]:
-                active_zones.remove(zone)
-
-        # ----------------------------------------------------
-        # 2. IDENTIFY NEW DBR FORMATIONS (Drop -> Base -> Rally)
-        # ----------------------------------------------------
-
-        if(current_candle["Is_Rally"]):
-            basing_candle_index = i-1
-            pattern_low = current_low
-            pattern_high = 0
+        # Stop when we find a Rally candle
+        if current_candle["Is_Rally"]:
+            basing_candle_index = i - 1
             base_count = 0
-            while(basing_candle_index>=0):
+
+            # Loop backward through any preceding Base candles
+            while basing_candle_index >= 0:
                 basing_candle = df.iloc[basing_candle_index]
+
                 if basing_candle["Is_Base"]:
-                    pattern_high = max(pattern_high, basing_candle["Close"], basing_candle["Open"])
-                    pattern_low = min(pattern_low, basing_candle["Low"])
                     base_count += 1
                     basing_candle_index -= 1
                 else:
                     break
+
+            # Check if we found at least one base AND the candle right before them is a Drop
             if base_count > 0 and basing_candle_index >= 0:
                 leg_in_candle = df.iloc[basing_candle_index]
-                if(leg_in_candle["Is_Drop"]):
-                    proximal = pattern_high
-                    distal = pattern_low
-                    active_zones.append(
+
+                if leg_in_candle["Is_Drop"]:
+                    found_zones.append(
                         {
-                            "leg_out_date": df.index[i],
-                            "leg_in_date": df.index[basing_candle_index],
-                            "formed_at": df.index[basing_candle_index + 1],
-                            "proximal_line": proximal,
-                            "distal_line": distal,
+                            "Leg_In_Date": df.index[basing_candle_index],
+                            "Leg_Out_Date": df.index[i]
                         }
                     )
 
-        # candle_minus_2 = df.iloc[i - 2]
-        # candle_minus_1 = df.iloc[i - 1]
-        #
-        # if (
-        #     candle_minus_2["Is_Drop"]
-        #     and candle_minus_1["Is_Base"]
-        #     and current_candle["Is_Rally"]
-        # ):
-        #     # Define structural boundaries
-        #     proximal = max(candle_minus_1["Open"], candle_minus_1["Close"])
-        #     distal = candle_minus_1["Low"]
-        #
-        #     active_zones.append(
-        #         {
-        #             "leg_out_date": df.index[i],
-        #             "formed_at": df.index[i - 1],
-        #             "proximal_line": proximal,
-        #             "distal_line": distal,
-        #         }
-        #     )
-    return pd.DataFrame(trade_logs)
+                    # NOTE: If you ONLY want the single most recent zone and want the
+                    # script to completely stop searching after finding one,
+                    # uncomment the 'break' statement below.
+                    # break
+
+    return pd.DataFrame(found_zones)
 
 
 # ----------------------------------------------------
-# RUNNING THE INITIAL SANDBOX
+# RUNNING THE SCANNER
 # ----------------------------------------------------
-# Basket of liquid Indian equities (Note the .NS suffix for NSE)
 ticker_basket = ["NUVAMA.NS"]
-all_results = []
+all_zones = []
 
 for ticker in ticker_basket:
     data = fetch_and_prep_data(ticker)
     if data is not None:
-        results = backtest_demand_zones(data)
-        if not results.empty:
-            results["Ticker"] = ticker
-            all_results.append(results)
+        zones_df = scan_for_dbr_zones(data)
+        if not zones_df.empty:
+            all_zones.append(zones_df)
 
-# Combine and analyze metrics
-if all_results:
-    master_df = pd.concat(all_results, ignore_index=True)
-    print("\n--- Phase 1 Backtest Summary ---")
-    print(master_df["Result"].value_counts(normalize=True) * 100)
-    print(f"\nTotal trades found across basket: {len(master_df)}")
+# Print the clean output
+if all_zones:
+    master_df = pd.concat(all_zones, ignore_index=True)
 
-    # NEW: Print the trade log table
-    print("\n--- Detailed Trade Log ---")
-    print(master_df.to_string())  # .to_string() forces Pandas to show all rows/columns
+    master_df = master_df.sort_values(by="Leg_Out_Date", ascending=True).reset_index(drop=True)
+
+    # Strip the timezone information for a cleaner output
+    master_df["Leg_In_Date"] = master_df["Leg_In_Date"].dt.tz_localize(None)
+    master_df["Leg_Out_Date"] = master_df["Leg_Out_Date"].dt.tz_localize(None)
+
+    print("\n--- DBR Zones Found (Newest to Oldest) ---")
+    print(master_df.to_string(col_space=25, justify="left"))
 else:
-    print("No valid structural trades found with current mathematical thresholds.")
+    print("No structural DBR zones found.")
