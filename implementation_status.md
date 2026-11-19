@@ -1,6 +1,6 @@
 # Implementation status
 
-The weekly buying-zone detector is implemented and tested with synthetic candles. The full trading strategy and backtest remain open. [Strategy specification](strategy_spec.md)
+The initial weekly buying-zone search is implemented and tested with synthetic candles. The Python detector returns the first structural DBR or RBR. The leg-out close filter, full-pattern search lines, overlap resolution, and collection of all valid zones are documented and await implementation. [Strategy specification](strategy_spec.md#refining-the-weekly-zone)
 
 ## Implemented
 
