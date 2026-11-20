@@ -1,10 +1,11 @@
-"""Find the confirmed weekly buying zone from historical OHLC candles."""
+"""Find confirmed weekly buying zones from historical OHLC candles."""
 
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
+from fractions import Fraction
 from typing import Literal
 
 
@@ -82,10 +83,17 @@ class BuyingZone:
     base: tuple[TimedCandle, ...]
     right_leg: TimedCandle
 
+    @property
+    def full_pattern_low(self) -> Decimal:
+        """Lowest wick across the leg-in, base run, and leg-out."""
+        return min(self.left_leg.candle.low, self.lower, self.right_leg.candle.low)
+
 
 def classify_candle(candle: Candle) -> CandleType:
-    body = abs(candle.close - candle.open)
-    if 2 * body <= candle.high - candle.low:
+    # Exact ratios keep the caller's Decimal precision out of the threshold check.
+    body = abs(Fraction(candle.close) - Fraction(candle.open))
+    full_range = Fraction(candle.high) - Fraction(candle.low)
+    if 2 * body <= full_range:
         return CandleType.BASE
     return CandleType.RALLY if candle.close > candle.open else CandleType.DROP
 
@@ -95,17 +103,11 @@ def _week_start(exchange_time: datetime) -> datetime:
     return midnight - timedelta(days=midnight.weekday())
 
 
-def find_weekly_buying_zone(
+def _prepare_weekly_search(
     weekly_candles: Iterable[TimedCandle],
     lower_timeframe_candles: Iterable[TimedCandle],
-    *,
     as_of: datetime,
-) -> BuyingZone | None:
-    """Use prior weeks and the current week's observed low as of the given time.
-
-    Supply one weekly candle per chart week. Lower-timeframe candles or snapshots
-    must use the same instrument and price adjustment as the weekly candles.
-    """
+) -> tuple[list[TimedCandle], Decimal] | None:
     as_of = _exchange_time(as_of)
     week_start = _week_start(as_of)
     anchor_low = min(
@@ -125,9 +127,17 @@ def find_weekly_buying_zone(
     )
     if len({_week_start(bar.starts_at) for bar in history}) != len(history):
         raise ValueError("Supply at most one weekly candle per prior chart week")
+    return history, anchor_low
 
-    line_price = anchor_low
-    index = len(history) - 1
+
+def _find_next_zone(
+    history: list[TimedCandle],
+    index: int,
+    *,
+    line_price: Decimal,
+    anchor_low: Decimal,
+) -> tuple[BuyingZone, int] | None:
+    """Return the next qualifying zone and the index before its leg-in."""
     while index >= 0:
         right_leg = history[index]
         index -= 1
@@ -150,7 +160,7 @@ def find_weekly_buying_zone(
         base = tuple(history[index + 1 : base_end + 1])
         left_leg = history[index]
         pattern = "RBR" if classify_candle(left_leg.candle) is CandleType.RALLY else "DBR"
-        return BuyingZone(
+        zone = BuyingZone(
             lower=min(bar.candle.low for bar in base),
             upper=max(max(bar.candle.open, bar.candle.close) for bar in base),
             pattern=pattern,
@@ -159,5 +169,63 @@ def find_weekly_buying_zone(
             base=base,
             right_leg=right_leg,
         )
+        index -= 1  # Both accepted and rejected patterns resume before the leg-in.
+        if candle.close > zone.upper:
+            return zone, index
+        line_price = zone.full_pattern_low
 
     return None
+
+
+def find_weekly_buying_zone(
+    weekly_candles: Iterable[TimedCandle],
+    lower_timeframe_candles: Iterable[TimedCandle],
+    *,
+    as_of: datetime,
+) -> BuyingZone | None:
+    """Return the first qualifying zone before overlap refinement.
+
+    Supply one weekly candle per chart week. Lower-timeframe candles or snapshots
+    must use the same instrument and price adjustment as the weekly candles.
+    """
+    search = _prepare_weekly_search(weekly_candles, lower_timeframe_candles, as_of)
+    if search is None:
+        return None
+    history, anchor_low = search
+    match = _find_next_zone(history, len(history) - 1, line_price=anchor_low, anchor_low=anchor_low)
+    return match[0] if match is not None else None
+
+
+def find_weekly_buying_zones(
+    weekly_candles: Iterable[TimedCandle],
+    lower_timeframe_candles: Iterable[TimedCandle],
+    *,
+    as_of: datetime,
+) -> list[BuyingZone]:
+    """Return valid zones in search order after resolving candidate overlaps.
+
+    Use the same as-of inputs as find_weekly_buying_zone. Each returned zone's
+    anchor_low is the observed current-week low that started the initial search.
+    """
+    search = _prepare_weekly_search(weekly_candles, lower_timeframe_candles, as_of)
+    if search is None:
+        return []
+    history, anchor_low = search
+    match = _find_next_zone(history, len(history) - 1, line_price=anchor_low, anchor_low=anchor_low)
+    if match is None:
+        return []
+
+    candidate, next_index = match
+    valid_zones = []
+    while match := _find_next_zone(
+        history, next_index, line_price=candidate.full_pattern_low, anchor_low=anchor_low
+    ):
+        older, next_index = match
+        if candidate.upper < older.lower or older.upper < candidate.lower:
+            valid_zones.append(candidate)
+            candidate = older
+        elif older.lower <= candidate.lower:
+            candidate = older
+
+    valid_zones.append(candidate)
+    return valid_zones
