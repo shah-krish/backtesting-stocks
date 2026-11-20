@@ -10,12 +10,12 @@ The body size is the absolute difference between the open and close. The full ra
 - D (drop). A decisive candle that closes below its open.
 - B (base). A candle whose body is half its full range or less, regardless of colour.
 
-A body of exactly half the range, a doji, and a valid zero-range candle all count as B.
+A body of exactly half the range, a doji, and a valid zero-range candle all count as B. The weekly detector compares twice the body with the range using exact fractions of the stored decimal prices, so the caller's decimal precision does not affect the label.
 
 ## Backward search
 
 1. Set the line price to the current week's low observed through the assessment time. Start searching from the most recent earlier weekly candle.
-2. Find the nearest candle to the left whose range contains the line price. The line can touch only a wick or sit exactly at the candle's high or low.
+2. Find the nearest earlier candle for which `low <= line_price <= high`. A line through the body, through a wick, or exactly at either endpoint counts.
 3. If the candle found is D or B, move the line to its low and continue strictly to its left. If it is R and the immediately preceding candle is decisive, move the line to that R's low and likewise continue strictly to its left.
 4. If the candle found is R and the immediately preceding candle is B, collect the full consecutive run of B candles before that R. The candle immediately before the run must be decisive. The pattern, in chronological order, is R–B–R or D–B–R, where B represents one or more consecutive base candles.
 5. The **leg-in** is the decisive candle immediately before the base run (D or R). The **leg-out** is the rally candle immediately after it (always R). For every DBR or RBR, require the leg-out close to be strictly above the highest body top across all base candles: `leg_out.close > max(max(b.open, b.close) for b in base)`. A close exactly at that level fails, even if the leg-out wick extends above it.
@@ -57,14 +57,18 @@ Start with this deterministic strategy module. As the remaining rules are agreed
 
 ## Python entry point
 
-Create a `TimedCandle` with `Candle(open, high, low, close)` and its timezone-aware start and end timestamps. Pass weekly candles and finer observations to the strategy for one instrument at a time.
+Use `find_weekly_buying_zones` to obtain all valid weekly zones for one instrument at a given assessment time. Supply weekly candles and finer observations on the same price-adjustment basis. Each `TimedCandle` contains a `Candle(open, high, low, close)` and timezone-aware start and end timestamps.
 
-    from weekly_buying_zone import find_weekly_buying_zone
+```python
+from weekly_buying_zone import find_weekly_buying_zones
 
-    zone = find_weekly_buying_zone(
-        weekly_candles,
-        lower_timeframe_candles,
-        as_of=assessment_time,
-    )
+zones = find_weekly_buying_zones(
+    weekly_candles,
+    lower_timeframe_candles,
+    as_of=assessment_time,
+)
+```
 
-The current Python function returns the first structural DBR or RBR found by the backward search, including its two price boundaries, the current week's low used for the search, the pattern, and its candles. A search without a match returns `None`. The leg-out close filter, overlap refinement, and full zone list await implementation.
+The function applies the leg-out close test and overlap rules, then returns the saved zones in backward-search order. It returns an empty list when no zone qualifies or no current-week low is available. To inspect the first qualifying candidate before overlap refinement, call `find_weekly_buying_zone` with the same inputs. It returns one `BuyingZone` or `None`. An older overlapping zone can replace that initial candidate in the refined list.
+
+Each `BuyingZone` records the marked edges (`lower`, `upper`), pattern (`DBR` or `RBR`), and source candles (`left_leg`, `base`, `right_leg`). Its `anchor_low` is the observed current-week low that started the assessment. Its `full_pattern_low` is the lowest wick across that particular pattern.
